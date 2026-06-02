@@ -7,10 +7,14 @@ MODEL_NAME = "Qwen/Qwen3-8B-GGUF"
 
 SYSTEM_PROMPT_EXTRACTING_MAIN_ENTITIES = """
 Ты - LLM для работы с извлечением информацией для пользователя. Тебе будут поступать запросы о металлургии и металах. 
-По запросу тебе необходимо выделить несколько ключевых слов и вывести их в формате строки с разделением КАЖДОГО СЛОВА через точку с запятой.
+По запросу тебе необходимо определить ключевые слова по которым будет осуществляться поиск в вершинах графа для данного запроса. Вывести их надо в формате строки с разделением КАЖДОГО СЛОВА через точку с запятой. 
+В качестве ключевых слов можно так же использовать синонимы или формульные обозначения. В области металлургии особенно важно. Например, медь может быть и медь и Cu, ниобиум Nb и так далее.
+
 Например:
 Q: Сколько градусов необходимо установить в печи чтобы расплавить медь?
 A: градусов;печи;расплавить;медь;
+Q: Сколько меди содержится в сплаве?
+A: медь;Cu4;сплав;
 """
 
 SYSTEM_PROMPT_EXTRACTION_RANGING = f"""
@@ -22,6 +26,11 @@ SYSTEM_PROMPT_EXTRACTION_RANGING = f"""
 
 SYSTEM_PROPT_EXTRACTION_EVALUATION = """
 Ты - LLM для работы с извлечением информацией для пользователя. Тебе необходимо ответить на вопрос достаточно ли информации для ответа на запрос пользователя.
+Если найденные пути уже содержат прямые связи между сущностями из вопроса
+и значения, необходимые для ответа, верни True.
+Не требуй полного обхода графа.
+Не продолжай поиск связанных химических элементов, если пользователь
+спрашивает только о содержании одного элемента.
 В ответе укажи только True или False. Больше ничего не пиши.
 """
 SYSTEM_PROMPT_NO_RAG = """
@@ -46,7 +55,7 @@ DRIVER = get_neo4j_driver(neo_cfg)
 llm = Llama.from_pretrained(repo_id="t-tech/T-lite-it-2.1-GGUF",
                             filename="*Q5_K_M.gguf",
                             n_gpu_layers=-1,
-                            n_ctx=4096)
+                            n_ctx=14000)
 PATHS = []
 
 
@@ -56,7 +65,10 @@ def find_start_concepts(driver, entities, limit=20):
     CALL (search_entity) {{
         MATCH (concept:EntityConcept)
         WHERE concept.norm = search_entity
-           OR (concept.norm CONTAINS search_entity)
+           OR (
+                size(search_entity) > 1
+                AND concept.norm CONTAINS search_entity
+            )
         WITH DISTINCT concept.name AS candidate_name,
             concept.norm AS candidate_norm
         RETURN candidate_name, candidate_norm
@@ -71,6 +83,7 @@ def find_start_concepts(driver, entities, limit=20):
         candidate_norm,
         candidate_norm = search_entity AS exact_match
     ORDER BY search_entity, exact_match DESC, candidate_norm
+    LIMIT 30
     """
 
     params = {
@@ -87,10 +100,22 @@ def find_relations(driver, paths, limit=20):
 
     query = f"""
     UNWIND $paths AS path
-    MATCH (current:EntityConcept)-[rel:RELATION_INSTANCE]-(neighbor:EntityConcept)
-    WHERE current.norm = path.current
-      AND NOT neighbor.norm IN path.nodes
-    RETURN DISTINCT
+
+    CALL (path) {{
+        MATCH (current:EntityConcept)-[rel:RELATION_INSTANCE]-(neighbor:EntityConcept)
+        WHERE current.norm = path.current
+        AND NOT neighbor.norm IN path.nodes
+
+        RETURN DISTINCT
+            current,
+            neighbor,
+            rel
+
+        ORDER BY neighbor.norm, rel.predicate
+        LIMIT $limit
+    }}
+
+    RETURN
         path.start AS start,
         current.name AS current_name,
         current.norm AS current_norm,
@@ -101,8 +126,8 @@ def find_relations(driver, paths, limit=20):
         rel.triplet_id AS triplet_id,
         rel.document_id AS document_id,
         startNode(rel).norm = current.norm AS outgoing
+
     ORDER BY start, current_norm, neighbor_norm, predicate
-    LIMIT $limit
     """
 
     params = {
@@ -121,6 +146,80 @@ def find_relations(driver, paths, limit=20):
 
     with driver.session() as session:
         return list(session.run(query, params))
+
+
+def get_frames_by_triplet_ids(driver, triplet_ids):
+    if not triplet_ids:
+        return {}
+
+    query = """
+    UNWIND $triplet_ids AS triplet_id
+
+    MATCH (trip:Triplet {triplet_id: triplet_id})
+          -[:HAS_FRAME]->(occ:FrameOccurrence)
+          -[:HAS_ROOT]->(root:FrameNode)
+
+    OPTIONAL MATCH (root)-[:CHILD*0..4]->(node:FrameNode)
+
+    RETURN
+      trip.triplet_id AS triplet_id,
+      occ.role AS role,
+      occ.root_text AS root_text,
+      collect(DISTINCT {
+        text: node.text,
+        norm: node.norm,
+        depth: node.depth,
+        path: node.path
+      }) AS frame_nodes
+    ORDER BY triplet_id, role
+    """
+
+    with driver.session() as session:
+        records = session.run(
+            query,
+            {"triplet_ids": list(set(triplet_ids))},
+        )
+
+        frames = {}
+
+        for record in records:
+            triplet_id = record["triplet_id"]
+
+            if triplet_id not in frames:
+                frames[triplet_id] = []
+
+            frames[triplet_id].append({
+                "role": record["role"],
+                "root_text": record["root_text"],
+                "nodes": record["frame_nodes"],
+            })
+
+    return frames
+
+
+def create_frame_prompt(frame):
+    root_text = str(frame.get("root_text") or "").strip()
+    root_norm = root_text.lower()
+    nodes = sorted(
+        frame.get("nodes", []),
+        key=lambda node: (str(node.get("path", "")), int(node.get("depth", 0))),
+    )
+    child_texts = []
+    seen = set()
+
+    for node in nodes:
+        node_text = str(node.get("text") or "").strip()
+        node_norm = node_text.lower()
+        if not node_text or node_norm == root_norm or node_norm in seen:
+            continue
+        seen.add(node_norm)
+        child_texts.append(node_text)
+
+    if not root_text or not child_texts:
+        return ""
+
+    return f"\n  Фрейм для {root_text}: {root_text} ({' -> '.join(child_texts)})"
+
 
 
 
@@ -148,6 +247,7 @@ def update_paths(paths, clean_records):
         current = record["current_norm"]
         predicate = record["predicate"]
         next_entity = record["neighbor_norm"]
+        triplet_id = record["triplet_id"]
 
         for path in paths:
             if path["start"] != start or path["current"] != current:
@@ -168,18 +268,43 @@ def update_paths(paths, clean_records):
                     "start": current,
                     "predicate": predicate,
                     "end": next_entity,
+                    "triplet_id": triplet_id
                 }],
             })
     return extends
 
 
-def create_path_prompt_for_eval(PATHS):
+def create_path_prompt_for_eval(driver, paths):
+    triplet_ids = []
+
+    for path in paths:
+        for step in path["paths"]:
+            if step.get("triplet_id") is not None:
+                triplet_ids.append(step["triplet_id"])
+
+    frames_by_triplet = get_frames_by_triplet_ids(
+        driver,
+        triplet_ids,
+    )
+
     prompt = ""
-    for path in PATHS:
-        query = f"{path["start"]}"
-        for steps in path["paths"]:
-           query += f" -> {steps["predicate"]} -> {steps["end"]}"
-        prompt += f"\n{query};"
+
+    for path in paths:
+        prompt += f"\nПуть: {path['start']}"
+
+        for step in path["paths"]:
+            prompt += f" -> {step['predicate']} -> {step['end']}"
+
+            frames = frames_by_triplet.get(
+                step.get("triplet_id"),
+                [],
+            )
+
+            for frame in frames:
+                prompt += create_frame_prompt(frame)
+
+        prompt += ";\n"
+
     return prompt
 
 def extract_start_points(user_prompt):
@@ -223,7 +348,10 @@ def general_search(user_prompt, PATHS):
         candidate_paths = update_paths(PATHS, clean_records)
         if not candidate_paths:
             break
-        prompt_for_checking_if_enough = create_path_prompt_for_eval(candidate_paths)
+        prompt_for_checking_if_enough = create_path_prompt_for_eval(DRIVER, candidate_paths)
+        print("-----------------------------------------------")
+        print(prompt_for_checking_if_enough)
+        print("-----------------------------------------------")
         eval_response = llm.create_chat_completion(
             messages = [
                 {"role": "system", "content": SYSTEM_PROPT_EXTRACTION_EVALUATION},
@@ -246,7 +374,7 @@ def general_search(user_prompt, PATHS):
                     {"role": "user", "content": prompt_for_checking_if_enough} # type: ignore
                 ]
             )["choices"][0]["message"]["content"]
-            PATHS = string_to_paths_select(candidate_paths, response_range_paths)
+            PATHS = string_to_paths_select(candidate_paths, response_range_paths)[:TOP_LIST]
             if not PATHS:
                 break
     return "Извините, не смогли найти точную информацию"
@@ -254,10 +382,11 @@ def general_search(user_prompt, PATHS):
 
 def answer(user_prompt):
     main_entities = extract_start_points(user_prompt)
+    start_concepts = find_start_concepts(DRIVER, main_entities)
     PATHS = []
-    for entity in main_entities:
-        if entity != '':
-            normalized_entity = entity.strip().lower()
+    for entity in start_concepts:
+        if entity["candidate_norm"] != '':
+            normalized_entity = entity["candidate_norm"].strip().lower()
             PATHS.append({
                 "start": normalized_entity,
                 "current": normalized_entity,
